@@ -1,7 +1,6 @@
-torch
-torchvision
 streamlit
 numpy
 pandas
 Pillow
+onnxruntime
 scikit-learn==1.6.1

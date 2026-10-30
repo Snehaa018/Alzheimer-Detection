@@ -3,97 +3,41 @@ import re, pickle
 import numpy as np
 import pandas as pd
 import streamlit as st
-import torch
-import torch.nn as nn
+import onnxruntime as ort
 from PIL import Image
-from torchvision import transforms
 
 st.set_page_config(page_title="Alzheimer's Disease Detection",
                    page_icon="🧠", layout="centered")
 
 
-# ── MRI model (must match the training class) ───────────────
-class SEBlock(nn.Module):
-    def __init__(self, channels, reduction=16):
-        super().__init__()
-        hidden = max(channels // reduction, 4)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channels, hidden), nn.ReLU(inplace=True),
-            nn.Linear(hidden, channels), nn.Sigmoid(),
-        )
-    def forward(self, x):
-        b, c, _, _ = x.shape
-        w = self.fc(self.pool(x).view(b, c)).view(b, c, 1, 1)
-        return x * w
-
-
-class ResBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, stride=1):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_ch)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_ch)
-        self.se = SEBlock(out_ch)
-        self.relu = nn.ReLU(inplace=True)
-        self.shortcut = nn.Identity()
-        if stride != 1 or in_ch != out_ch:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_ch),
-            )
-    def forward(self, x):
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = self.se(out)
-        return self.relu(out + self.shortcut(x))
-
-
-class AlzheimerCNN(nn.Module):
-    def __init__(self, num_classes=4):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1, bias=False),
-            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-            ResBlock(32, 64, stride=2),
-            ResBlock(64, 128, stride=2),
-            ResBlock(128, 256, stride=2),
-            ResBlock(256, 256, stride=1),
-            nn.AdaptiveAvgPool2d(1),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(), nn.Dropout(0.4),
-            nn.Linear(256, 128), nn.ReLU(inplace=True),
-            nn.Dropout(0.3), nn.Linear(128, num_classes),
-        )
-    def forward(self, x):
-        return self.classifier(self.features(x))
-
-
-# ── Loading ─────────────────────────────────────────────────
 @st.cache_resource
 def load_all():
     with open("classes.pkl", "rb") as f:
         classes = pickle.load(f)
-    cnn = AlzheimerCNN(num_classes=len(classes))
-    cnn.load_state_dict(torch.load("alzheimer_cnn.pth", map_location="cpu"))
-    cnn.eval()
+    sess = ort.InferenceSession("alzheimer_cnn.onnx",
+                                providers=["CPUExecutionProvider"])
     with open("clinical_model.pkl", "rb") as f:
         clin = pickle.load(f)
-    return cnn, classes, clin
+    return sess, classes, clin
 
-cnn, classes, clin = load_all()
-
-transform = transforms.Compose([
-    transforms.Resize((128, 128)),
-    transforms.Grayscale(num_output_channels=3),
-    transforms.ToTensor(),
-    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-])
+sess, classes, clin = load_all()
+input_name = sess.get_inputs()[0].name
 
 
-# ── Helpers ─────────────────────────────────────────────────
+def preprocess(img):
+    g = img.resize((128, 128), Image.BILINEAR).convert("L")
+    a = np.asarray(g, dtype=np.float32) / 255.0
+    a = (a - 0.5) / 0.5
+    a = np.stack([a, a, a], axis=0)[None, ...]
+    return a.astype(np.float32)
+
+
+def softmax(z):
+    z = z - z.max()
+    e = np.exp(z)
+    return e / e.sum()
+
+
 def norm(name):
     n = re.sub(r"[^a-z]", "", str(name).lower())
     return n.replace("dementia", "demented")
@@ -119,8 +63,6 @@ def clinical_probs(values):
 COLORS = {"nondemented": "green", "verymilddemented": "orange",
           "milddemented": "orange", "moderatedemented": "red"}
 
-
-# ── UI ──────────────────────────────────────────────────────
 st.title("🧠 Alzheimer's Disease Detection")
 st.markdown("Upload a brain MRI and, optionally, enter clinical values. "
             "The MRI model and the clinical model each give probabilities, "
@@ -163,9 +105,8 @@ if st.button("🔍 Predict", use_container_width=True, type="primary"):
         st.error("Please upload an MRI image first!")
     else:
         with st.spinner("Analysing..."):
-            x = transform(img).unsqueeze(0)
-            with torch.no_grad():
-                p_img = torch.softmax(cnn(x), dim=1)[0].numpy()
+            logits = sess.run(None, {input_name: preprocess(img)})[0][0]
+            p_img = softmax(logits)
 
             if values is not None:
                 p_clin = clinical_probs(values)
